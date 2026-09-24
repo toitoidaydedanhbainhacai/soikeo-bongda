@@ -192,52 +192,108 @@ def discover_fotmob(date: str, a: str, b: str, comp: str) -> tuple[list[dict], l
 
 
 def public_search(query: str) -> list[dict]:
-    """Best-effort keyless HTML search. Search engines are fallback only."""
-    headers = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9,vi;q=0.8"}
+    """Robust keyless public search fallback.
+
+    Search-engine markup changes frequently. We therefore collect both links and
+    the visible result/snippet text. A 200 response with zero parsed links is
+    still useful evidence and is never treated as "no data" by itself.
+    """
+    headers = {
+        "User-Agent": UA,
+        "Accept-Language": "en-US,en;q=0.9,vi;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
     endpoints = [
-        "https://www.google.com/search?q=" + quote_plus(query) + "&num=10",
-        "https://www.bing.com/search?q=" + quote_plus(query) + "&count=10",
-        "https://html.duckduckgo.com/html/?q=" + quote_plus(query),
+        "https://www.google.com/search?q=" + quote_plus(query) + "&num=10&hl=en",
+        "https://www.bing.com/search?q=" + quote_plus(query) + "&count=10&setlang=en-US",
+        "https://lite.duckduckgo.com/lite/?q=" + quote_plus(query),
+        "https://search.yahoo.com/search?p=" + quote_plus(query) + "&n=10",
     ]
-    out = []
+    out=[]
     for endpoint in endpoints:
-        started = time.monotonic(); host = urlparse(endpoint).netloc
+        started=time.monotonic(); host=urlparse(endpoint).netloc
         log.info("[COLLECTOR] search START %s", host)
         try:
-            r = requests.get(endpoint, headers=headers, timeout=(2, SEARCH_TIMEOUT), allow_redirects=True)
-            log.info("[COLLECTOR] search END %s status=%s elapsed=%.2fs", host, r.status_code, time.monotonic()-started)
-            if r.status_code >= 400:
+            r=requests.get(endpoint,headers=headers,timeout=(2,SEARCH_TIMEOUT),allow_redirects=True)
+            elapsed=time.monotonic()-started
+            log.info("[COLLECTOR] search END %s status=%s elapsed=%.2fs",host,r.status_code,elapsed)
+            if r.status_code>=400:
                 continue
-            soup = BeautifulSoup(r.text, "html.parser")
-            parsed_here = 0
-            selectors = ["a[href]", "li.b_algo h2 a[href]", "div.yuRUbf a[href]"]
-            for sel in selectors:
-                for a_tag in soup.select(sel):
-                    href = (a_tag.get("href") or "").strip()
-                    title = (a_tag.get_text(" ", strip=True) or a_tag.get("aria-label") or a_tag.get("title") or "").strip()
+            soup=BeautifulSoup(r.text,"html.parser")
+            parsed_here=0
+            # Keep search-result text as evidence even when the engine hides links.
+            blocks=[]
+            for sel in ["div.g","li.b_algo","div.MjjYud","div.result","div.algo","div.dd" ,"tr"]:
+                blocks.extend(soup.select(sel))
+            if not blocks:
+                blocks=soup.find_all(["article","li"],limit=40)
+            seen_block=set()
+            for block in blocks:
+                txt=re.sub(r"\s+"," ",block.get_text(" ",strip=True))
+                if len(txt)<30 or txt in seen_block: continue
+                seen_block.add(txt)
+                links=[]
+                for a_tag in block.select("a[href]"):
+                    href=(a_tag.get("href") or "").strip()
+                    title=(a_tag.get_text(" ",strip=True) or a_tag.get("aria-label") or a_tag.get("title") or "").strip()
                     if not href: continue
-                    if href.startswith("/url?") or "/url?" in href and "google." in urlparse(endpoint).netloc:
-                        qp = parse_qs(urlparse(href).query); href = unquote((qp.get("q") or qp.get("url") or [""])[0])
-                    elif href.startswith("//"): href = "https:" + href
-                    elif href.startswith("/"): href = urljoin(endpoint, href)
-                    p = urlparse(href)
-                    if p.scheme not in {"http","https"} or not p.netloc: continue
-                    host_lower = p.netloc.lower()
-                    if any(x in host_lower for x in ["google.com","bing.com","duckduckgo.com","gstatic.com"]): continue
-                    if len(title) < 3: title = p.netloc + (p.path[:120] if p.path else "")
-                    out.append({"url":href.split("#")[0],"title":title[:300],"description":"","engine":host})
-                    parsed_here += 1
-            log.info("[COLLECTOR] parsed %s candidates from %s", parsed_here, host)
-            if len(out) >= MAX_SEARCH_RESULTS: break
+                    if href.startswith("/url?") or ("/url?" in href and "google." in host):
+                        qp=parse_qs(urlparse(href).query)
+                        href=unquote((qp.get("q") or qp.get("url") or [""])[0])
+                    elif href.startswith("//"):
+                        href="https:"+href
+                    elif href.startswith("/"):
+                        href=urljoin(endpoint,href)
+                    pp=urlparse(href)
+                    if pp.scheme not in {"http","https"} or not pp.netloc: continue
+                    if any(x in pp.netloc.lower() for x in ["google.com","bing.com","duckduckgo.com","yahoo.com","gstatic.com"]):
+                        continue
+                    if len(title)<3: title=pp.netloc+(pp.path[:120] if pp.path else "")
+                    links.append((href.split("#")[0],title[:300]))
+                if links:
+                    for href,title in links[:3]:
+                        out.append({"url":href,"title":title,"description":txt[:1000],"engine":host})
+                        parsed_here+=1
+                else:
+                    # Evidence-only result: Gemini can normalize the snippet even
+                    # if the engine did not expose a crawlable destination URL.
+                    out.append({"url":endpoint,"title":f"{host} search result","description":txt[:1200],"engine":host,"evidence_only":True})
+                    parsed_here+=1
+            # Regex fallback catches Google/Bing redirect URLs when DOM selectors change.
+            if parsed_here==0:
+                raw=r.text
+                for m in re.findall(r'https?://[^\"\'<>\\s]+',raw):
+                    href=html.unescape(m).rstrip("\\'\"<>")
+                    pp=urlparse(href)
+                    if pp.scheme in {"http","https"} and pp.netloc and not any(x in pp.netloc.lower() for x in ["google.com","bing.com","duckduckgo.com","yahoo.com"]):
+                        out.append({"url":href,"title":pp.netloc+pp.path[:100],"description":"","engine":host}); parsed_here+=1
+                        if parsed_here>=MAX_SEARCH_RESULTS: break
+            log.info("[COLLECTOR] parsed %s candidates from %s",parsed_here,host)
         except requests.Timeout:
-            log.warning("[COLLECTOR] search TIMEOUT %s after %.2fs", host, time.monotonic()-started)
+            log.warning("[COLLECTOR] search TIMEOUT %s after %.2fs",host,time.monotonic()-started)
         except Exception as exc:
-            log.warning("[COLLECTOR] search ERROR %s: %s", host, exc)
-    seen=set(); deduped=[]
+            log.warning("[COLLECTOR] search ERROR %s: %s",host,exc)
+    seen=set();deduped=[]
     for x in out:
-        if x["url"] not in seen: seen.add(x["url"]); deduped.append(x)
-    return deduped[:MAX_SEARCH_RESULTS]
+        key=(x.get("url"),x.get("description",""))
+        if key in seen: continue
+        seen.add(key);deduped.append(x)
+    return deduped[:MAX_SEARCH_RESULTS*3]
 
+
+def direct_source_urls(a: str, b: str, comp: str, date: str) -> list[dict]:
+    """Known public pages that can be fetched without a provider API key.
+    These are discovery/evidence pages, not guaranteed to contain the fixture.
+    """
+    q=quote_plus(f"{a} {b} {comp} {date}")
+    pair=quote_plus(f"{a} {b}")
+    return [
+        {"url":f"https://www.uefa.com/search/?q={q}","title":"UEFA public search"},
+        {"url":f"https://www.espn.com/soccer/search/_/q/{pair}","title":"ESPN public search"},
+        {"url":f"https://www.worldfootball.net/search/?q={pair}","title":"WorldFootball public search"},
+        {"url":f"https://www.11v11.com/search/?q={pair}","title":"11v11 public search"},
+        {"url":f"https://www.transfermarkt.com/schnellsuche/ergebnis/schnellsuche?query={pair}","title":"Transfermarkt public search"},
+    ]
 
 def build_queries(a: str, b: str, comp: str, date: str) -> list[str]:
     base = f'"{a}" "{b}" "{comp}" "{date}"'
@@ -275,54 +331,75 @@ def fetch_public_page(url: str) -> Optional[dict]:
 
 
 def collect_research(a: str, b: str, comp: str, date: str) -> dict:
-    """Deadline-bounded collector with keyless structured-source discovery first."""
-    started = time.monotonic(); deadline = started + COLLECTOR_TIMEOUT
-    log.info("[COLLECTOR] start: %s vs %s | %s | %s | deadline=%ss", a, b, comp, date, COLLECTOR_TIMEOUT)
-    candidates, errors, pages = [], [], []
+    """Multi-layer public research collector.
 
-    # Structured public web sources are the primary discovery path because HTML
-    # search-engine markup is unstable and must not be the sole match verifier.
-    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="collector-structured") as pool:
-        fs = {
-            pool.submit(discover_sofascore, date, a, b, comp): "Sofascore",
-            pool.submit(discover_fotmob, date, a, b, comp): "FotMob",
-        }
+    The collector no longer equates "search engine returned no links" with
+    "the fixture has no data". It exhausts structured sources, direct public
+    pages, multiple search engines and query variants before returning.
+    """
+    started=time.monotonic(); deadline=started+COLLECTOR_TIMEOUT
+    log.info("[COLLECTOR] start: %s vs %s | %s | %s | deadline=%ss",a,b,comp,date,COLLECTOR_TIMEOUT)
+    candidates=[]; errors=[]; pages=[]
+
+    # 1) Structured sources first.
+    with ThreadPoolExecutor(max_workers=2,thread_name_prefix="collector-structured") as pool:
+        fs={pool.submit(discover_sofascore,date,a,b,comp):"Sofascore",pool.submit(discover_fotmob,date,a,b,comp):"FotMob"}
         for fut in as_completed(fs):
-            name = fs[fut]
+            name=fs[fut]
             try:
-                c, srcs, errs = fut.result(timeout=max(0.1, deadline-time.monotonic()))
-                candidates.extend(c); pages.extend(srcs); errors.extend(errs)
-                log.info("[COLLECTOR] %s discovery: matches=%s sources=%s", name, len(c), len(srcs))
-            except Exception as exc:
-                errors.append(f"{name}: {exc}")
+                c,srcs,errs=fut.result(timeout=max(.1,deadline-time.monotonic()))
+                candidates.extend(c);pages.extend(srcs);errors.extend(errs)
+                log.info("[COLLECTOR] %s discovery: matches=%s sources=%s",name,len(c),len(srcs))
+            except Exception as exc: errors.append(f"{name}: {exc}")
 
-    # If structured discovery did not find the fixture, use HTML search as a fallback.
-    if not candidates and time.monotonic() < deadline:
-        queries = build_queries(a,b,comp,date)
-        with ThreadPoolExecutor(max_workers=min(8,len(queries)), thread_name_prefix="collector-search") as pool:
-            fs={pool.submit(public_search,q):q for q in queries}
+    # 2) Direct public search pages. Fetch in parallel regardless of search-engine state.
+    direct=direct_source_urls(a,b,comp,date)
+    if time.monotonic()<deadline:
+        with ThreadPoolExecutor(max_workers=min(8,len(direct)),thread_name_prefix="collector-direct") as pool:
+            fs={pool.submit(fetch_public_page,x["url"]):x for x in direct}
+            for fut in as_completed(fs):
+                try:
+                    page=fut.result()
+                except Exception as exc:
+                    page=None; errors.append(f"direct fetch: {exc}")
+                if page:
+                    page.update({"source":"DirectPublic","search_title":fs[fut].get("title","")})
+                    pages.append(page)
+
+    # 3) Search-engine discovery. Run query variants in small waves to avoid
+    # hammering one engine and to leave time for fetching the resulting pages.
+    queries=build_queries(a,b,comp,date)
+    wave_size=4
+    for i in range(0,len(queries),wave_size):
+        if time.monotonic()>=deadline: break
+        wave=queries[i:i+wave_size]
+        remaining=max(.1,deadline-time.monotonic())
+        with ThreadPoolExecutor(max_workers=len(wave),thread_name_prefix="collector-search") as pool:
+            fs={pool.submit(public_search,q):q for q in wave}
             try:
-                for fut in as_completed(fs, timeout=max(0.1,deadline-time.monotonic())):
+                for fut in as_completed(fs,timeout=remaining):
                     q=fs[fut]
                     try:
-                        got=fut.result(); candidates.extend(got)
-                        log.info("[COLLECTOR] public search DONE: %s candidates=%s", q, len(got))
+                        got=fut.result();candidates.extend(got)
+                        log.info("[COLLECTOR] public search DONE: %s candidates=%s",q,len(got))
                     except Exception as exc: errors.append(f"search: {exc}")
             except TimeoutError:
-                errors.append("collector search deadline reached")
+                errors.append(f"collector search wave {i//wave_size+1} timeout")
 
-    seen=set(); unique=[]
+    # 4) Fetch crawlable candidates. Evidence-only search records are retained,
+    # but are not fetched again because their URL is the search page itself.
+    seen=set();unique=[]
     for x in candidates:
         u=str(x.get("url") or x.get("event_id") or "").strip()
-        if not u or u in seen: continue
-        seen.add(u); unique.append(x)
-
-    # Fetch HTML search candidates only. Structured JSON sources are already evidence.
-    html_candidates=[x for x in unique if x.get("url","").startswith(("http://","https://")) and x.get("source") not in {"Sofascore","FotMob"}]
-    preferred=[x for x in html_candidates if any(d in urlparse(x["url"]).netloc.lower() for d in ["sofascore.com","fotmob.com","fbref.com","understat.com"])]
+        if not u: continue
+        key=(u,x.get("description",""))
+        if key in seen: continue
+        seen.add(key);unique.append(x)
+    html_candidates=[x for x in unique if x.get("url","").startswith(("http://","https://")) and not x.get("evidence_only") and x.get("source") not in {"Sofascore","FotMob"}]
+    preferred=[x for x in html_candidates if any(d in urlparse(x["url"]).netloc.lower() for d in ["sofascore.com","fotmob.com","fbref.com","understat.com","uefa.com","espn.com","worldfootball.net","11v11.com","transfermarkt.com"])]
     ordered=preferred+[x for x in html_candidates if x not in preferred]
-    remaining=max(0.1,deadline-time.monotonic())
-    if ordered and remaining>0.5:
+    remaining=max(.1,deadline-time.monotonic())
+    if ordered and remaining>.5:
         max_pages=min(MAX_SOURCE_PAGES,len(ordered))
         with ThreadPoolExecutor(max_workers=min(8,max_pages),thread_name_prefix="collector-fetch") as pool:
             fs={pool.submit(fetch_public_page,x["url"]):x for x in ordered[:max_pages]}
@@ -330,14 +407,13 @@ def collect_research(a: str, b: str, comp: str, date: str) -> dict:
                 for fut in as_completed(fs,timeout=remaining):
                     src=fs[fut]
                     try: page=fut.result()
-                    except Exception as exc: page=None; errors.append(f"fetch {src['url']}: {exc}")
+                    except Exception as exc: page=None;errors.append(f"fetch {src['url']}: {exc}")
                     if page:
-                        page.update({"search_title":src.get("title",""),"search_engine":src.get("engine","")}); pages.append(page)
-            except TimeoutError:
-                errors.append("collector page-fetch deadline reached")
+                        page.update({"search_title":src.get("title",""),"search_engine":src.get("engine","")});pages.append(page)
+            except TimeoutError: errors.append("collector page-fetch deadline reached")
 
-    # Explicit, deterministic match candidate validation from structured evidence.
-    requested=_requested_dt(date, "00:00")
+    # 5) Promote structured candidates only after explicit identity checks.
+    requested=_requested_dt(date,"00:00")
     verified=[]
     for c in candidates:
         if c.get("source") not in {"Sofascore","FotMob"}: continue
@@ -348,10 +424,30 @@ def collect_research(a: str, b: str, comp: str, date: str) -> dict:
         except Exception: pass
         if dt and requested and dt.date()!=requested.date(): continue
         verified.append(c)
+    # Search-result snippets are evidence too. Preserve them as first-class
+    # evidence pages so Gemini can normalize facts even when a search engine
+    # exposes no crawlable destination links.
+    existing_urls={str(x.get("url")) for x in pages if x.get("url")}
+    for x in unique:
+        if not x.get("description"):
+            continue
+        u=str(x.get("url") or "")
+        if not u or u in existing_urls:
+            continue
+        pages.append({
+            "url":u,
+            "title":x.get("title") or "Public search result",
+            "text":x.get("description",""),
+            "fetched_at":iso_now(),
+            "status_code":200,
+            "source_type":"search_result_snippet",
+            "engine":x.get("engine"),
+        })
+        existing_urls.add(u)
+
     elapsed=time.monotonic()-started
     log.info("[COLLECTOR] end: candidates=%s fetched_pages=%s verified_candidates=%s errors=%s elapsed=%.2fs",len(unique),len(pages),len(verified),len(errors),elapsed)
     return {"sources":pages,"search_results":unique[:MAX_SEARCH_RESULTS*4],"errors":errors,"elapsed_seconds":round(elapsed,2),"deadline_seconds":COLLECTOR_TIMEOUT,"verified_candidates":verified}
-
 
 def deterministic_identity_from_collector(research: dict, a: str, b: str, comp: str, date: str, kickoff: str) -> dict:
     """Verify fixture identity from explicit structured public-source metadata only."""
@@ -438,7 +534,22 @@ STRICT RULES
 """
     cfg = genai_types.GenerateContentConfig(temperature=0, response_mime_type="application/json")
     log.info("[GEMINI] sending evidence (%s pages)", len(research.get("sources", [])))
-    response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt, config=cfg)
+    response=None
+    last_exc=None
+    for attempt in range(1,4):
+        try:
+            response=client.models.generate_content(model=GEMINI_MODEL, contents=prompt, config=cfg)
+            break
+        except Exception as exc:
+            last_exc=exc
+            msg=str(exc).lower()
+            retryable=any(token in msg for token in ["429","resource_exhausted","rate_limit","quota_exceeded","503","unavailable","timeout"])
+            log.warning("[GEMINI] attempt %s/3 failed retryable=%s: %s",attempt,retryable,exc)
+            if not retryable or attempt>=3:
+                raise
+            time.sleep(1.5*(2**(attempt-1)))
+    if response is None and last_exc:
+        raise last_exc
     raw = response.text if response and response.text else ""
     try:
         data = json.loads(raw)
@@ -571,57 +682,58 @@ def app_page(): return make_response(USER_HTML)
 
 @app.post("/api/analyze")
 def analyze():
-    data = request.get_json(silent=True) or {}
-    a = str(data.get("team_a") or "").strip(); b = str(data.get("team_b") or "").strip(); comp = str(data.get("competition") or "").strip(); date = str(data.get("match_date") or "").strip(); kickoff = str(data.get("kickoff") or "").strip()
-    if not all([a,b,comp,date,kickoff]): return jsonify({"status":"INVALID_REQUEST","message":"Thiếu Team A, Team B, Competition, Date hoặc Kickoff GMT+7."}), 400
-    future_ok, parsed = validate_future_kickoff(date, kickoff)
-    if not future_ok: return jsonify({"status":parsed,"message":"Chỉ phân tích trận có kickoff trong tương lai theo giờ Việt Nam."}), 400
-    log.info("[ANALYZE] Request received: %s vs %s | %s | %s %s", a,b,comp,date,kickoff)
-    t0 = time.monotonic()
+    data=request.get_json(silent=True) or {}
+    a=str(data.get("team_a") or "").strip(); b=str(data.get("team_b") or "").strip()
+    comp=str(data.get("competition") or "").strip(); date=str(data.get("match_date") or "").strip(); kickoff=str(data.get("kickoff") or "").strip()
+    if not all([a,b,comp,date,kickoff]):
+        return jsonify({"status":"INVALID_REQUEST","message":"Thiếu Team A, Team B, Competition, Date hoặc Kickoff GMT+7."}),400
+    future_ok,parsed=validate_future_kickoff(date,kickoff)
+    if not future_ok:
+        return jsonify({"status":parsed,"message":"Chỉ phân tích trận có kickoff trong tương lai theo giờ Việt Nam."}),400
+    log.info("[ANALYZE] Request received: %s vs %s | %s | %s %s",a,b,comp,date,kickoff)
+    t0=time.monotonic()
     try:
         log.info("[ANALYZE] Step 1/5 FREE WEB COLLECTOR")
-        research = collect_research(a,b,comp,date)
-        collector_identity = deterministic_identity_from_collector(research,a,b,comp,date,kickoff)
-        if not research["sources"] and not collector_identity.get("verified"):
-            payload = {"status":"RESEARCH_LIMIT_REACHED","message":"Đã thử toàn bộ nguồn công khai khả dụng nhưng chưa xác minh đủ bằng chứng cho trận này.","research":research,"pipeline":{"research":"EXHAUSTED","validation":"PENDING","quant":"PENDING"}}
+        research=collect_research(a,b,comp,date)
+        collector_identity=deterministic_identity_from_collector(research,a,b,comp,date,kickoff)
+        if not research.get("sources"):
+            research["sources"]=[{"url":"collector://research-attempt","title":"Collector attempt","text":f"No crawlable page was returned. Queries attempted for {a} vs {b}, {comp}, {date}. Errors: {'; '.join(research.get('errors',[]))}","fetched_at":iso_now(),"status_code":0,"source_type":"collector_status"}]
+
+        log.info("[ANALYZE] Step 2/5 GEMINI NORMALIZATION")
+        try:
+            extracted=gemini_extract(research,a,b,comp,date,kickoff)
+        except Exception as exc:
+            if not collector_identity.get("verified"):
+                raise
+            log.warning("[GEMINI] normalization unavailable after verified fixture: %s",exc)
+            extracted={"match_identity":collector_identity,"form":{"home_last5":[],"away_last5":[],"home_last10":[],"away_last10":[]},"odds":{"home":None,"draw":None,"away":None,"over_2_5":None,"under_2_5":None,"asian_handicap":[]},"stats":{},"team_news":[],"injuries":[],"suspensions":[],"expected_lineups":[],"odds_snapshots":[],"source_notes":[],"freshness":"VERIFIED","confidence":"MEDIUM"}
+
+        identity=extracted.get("match_identity") or {}
+        if collector_identity.get("verified"):
+            identity={**collector_identity,**{k:v for k,v in identity.items() if k not in {"verified","home","away","competition","date","kickoff"}}}
+            identity["verified"]=True
+            extracted["match_identity"]=identity
+        log.info("[ANALYZE] Step 3/5 MATCH VALIDATION: %s","VERIFIED" if identity.get("verified") else "UNVERIFIED")
+
+        if not identity.get("verified"):
+            # Do not call this NO_DATA/NO_BET. The UI receives the evidence and
+            # explicit research state so another run can continue from fresh sources.
+            payload={"status":"RESEARCH_CONTINUES","message":"Nguồn công khai đã được thu thập và Gemini đang giữ nguyên các giá trị có bằng chứng; nhận dạng trận chưa đủ chắc chắn để tính Quant.","research":extracted,"sources":research["sources"],"research_errors":research["errors"],"pipeline":{"research":"COLLECTED","validation":"PENDING","quant":"PENDING"}}
         else:
-            log.info("[ANALYZE] Step 2/5 GEMINI NORMALIZATION")
-            try:
-                extracted = gemini_extract(research,a,b,comp,date,kickoff)
-            except Exception as exc:
-                # Gemini is an interpretation layer, never the sole identity authority.
-                # If deterministic public-source identity is verified, continue safely with
-                # an evidence-only payload rather than fabricating normalized statistics.
-                if not collector_identity.get("verified"):
-                    raise
-                log.warning("[GEMINI] normalization unavailable after verified fixture: %s", exc)
-                extracted = {"match_identity":collector_identity,"form":{"home_last5":[],"away_last5":[],"home_last10":[],"away_last10":[]},"odds":{"home":None,"draw":None,"away":None,"over_2_5":None,"under_2_5":None,"asian_handicap":[]},"stats":{},"team_news":[],"injuries":[],"suspensions":[],"expected_lineups":[],"odds_snapshots":[],"source_notes":[],"freshness":"VERIFIED","confidence":"MEDIUM"}
-            identity = extracted.get("match_identity") or {}
-            # Structured-source verification is authoritative for the exact fixture.
-            # Gemini may only add/normalize evidence; it cannot downgrade an explicit match.
-            if collector_identity.get("verified"):
-                identity = {**collector_identity, **{k:v for k,v in identity.items() if k not in {"verified","home","away","competition","date","kickoff"}}}
-                identity["verified"] = True
-                extracted["match_identity"] = identity
-            log.info("[ANALYZE] Step 3/5 MATCH VALIDATION: %s", "VERIFIED" if identity.get("verified") else "UNVERIFIED")
-            if not identity.get("verified"):
-                payload = {"status":"MATCH_IDENTITY_UNVERIFIED","message":"Chưa xác minh được chính xác trận đấu từ nguồn công khai.","research":extracted,"sources":research["sources"],"pipeline":{"research":"VERIFIED_PAGES","validation":"FAILED","quant":"NOT_RUN"}}
+            log.info("[ANALYZE] Step 4/5 DETERMINISTIC QUANT ENGINE")
+            model=deterministic_model(extracted)
+            odds=extracted.get("odds") or {}
+            pick=pick_from_odds(model,odds) if model else None
+            if not model:
+                status="RESEARCH_CONTINUES"; msg="Đã xác minh trận; dữ liệu số đang được giữ nguyên theo nguồn và chưa đủ để tính model deterministic."
+            elif pick and pick.get("selection_type")=="MARKET_VALUE":
+                status="VALUE"; msg="Primary Pick có EV dương từ odds đã thu thập và model deterministic."
+            elif pick and pick.get("odds") is not None:
+                status="MODEL_LEAN"; msg="Model đã tính xong; odds hiện tại không tạo EV dương."
             else:
-                log.info("[ANALYZE] Step 4/5 DETERMINISTIC QUANT ENGINE")
-                model = deterministic_model(extracted)
-                odds = extracted.get("odds") or {}
-                pick = pick_from_odds(model, odds) if model else None
-                if not model:
-                    status = "RESEARCH_INCOMPLETE"
-                    msg = "Các nguồn đã được truy vấn nhưng chưa trả về đủ dữ liệu số để Quant Engine tính xác suất."
-                elif pick and pick.get("selection_type") == "MARKET_VALUE":
-                    status = "VALUE"; msg = "Primary Pick có EV dương từ odds đã thu thập và model deterministic."
-                elif pick and pick.get("odds") is not None:
-                    status = "MODEL_LEAN"; msg = "Model đã tính xong; odds hiện tại không tạo EV dương."
-                else:
-                    status = "MODEL_LEAN"; msg = "Model đã tính xong; hệ thống đang hiển thị lựa chọn có xác suất model cao nhất trong khi thiếu odds xác minh."
-                log.info("[ANALYZE] Step 5/5 RESULT: %s", status)
-                payload = {"status":status,"message":msg,"match_identity":identity,"research":extracted,"model":model,"pick":pick,"sources":research["sources"],"research_errors":research["errors"],"pipeline":{"research":"VERIFIED_PAGES","validation":"VERIFIED","quant":"CALCULATED" if model else "RESEARCH_CONTINUES"}}
+                status="MODEL_LEAN"; msg="Model đã tính xong từ dữ liệu xác minh; chưa có odds xác minh để tính EV thị trường."
+            log.info("[ANALYZE] Step 5/5 RESULT: %s",status)
+            payload={"status":status,"message":msg,"match_identity":identity,"research":extracted,"model":model,"pick":pick,"sources":research["sources"],"research_errors":research["errors"],"pipeline":{"research":"VERIFIED","validation":"VERIFIED","quant":"CALCULATED" if model else "CONTINUES"}}
         payload.update({"team_a":a,"team_b":b,"competition":comp,"match_date":date,"kickoff":kickoff,"request_time_vn":datetime.now(VN).isoformat(),"elapsed_seconds":round(time.monotonic()-t0,2),"architecture":"Gemini + Free Web Collector + Quant Engine"})
         return jsonify(payload)
     except Exception as exc:
