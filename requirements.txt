@@ -1,5 +1,6 @@
 Flask>=3.1,<4
 requests>=2.34,<3
+beautifulsoup4>=4.13,<5
 psycopg[binary]>=3.3,<4
 google-genai>=1.75,<2
 gunicorn>=23,<24
