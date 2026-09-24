@@ -157,17 +157,30 @@ def init_db():
                     if col not in existing:
                         conn.execute(f'ALTER TABLE "{table}" ADD COLUMN "{col}" {definition}')
 
-                # Legacy PostgreSQL builds may have created analyses.id as BIGINT/SERIAL.
-                # The current application uses opaque text IDs such as an_*. Convert the
-                # existing column in-place so new analyses cannot fail with bigint errors.
-                if table == "analyses":
+                # Legacy Render databases may contain BIGINT/SERIAL identifiers in
+                # tables that the current application writes with opaque text IDs
+                # (an_*, log_*, usr_*).  CREATE TABLE IF NOT EXISTS cannot change an
+                # existing column, so migrate every ID/user_id column that the current
+                # code expects to be TEXT.  Drop sequence defaults first.
+                text_columns = {
+                    "users": ["id"],
+                    "access_keys": ["user_id"],
+                    "analyses": ["id", "user_id"],
+                    "usage_logs": ["id", "user_id"],
+                }.get(table, [])
+                for text_col in text_columns:
                     id_type_row = conn.execute(
-                        "SELECT data_type FROM information_schema.columns "
-                        "WHERE table_schema='public' AND table_name='analyses' AND column_name='id'"
+                        "SELECT data_type, column_default, is_identity FROM information_schema.columns "
+                        "WHERE table_schema='public' AND table_name=%s AND column_name=%s",
+                        (table, text_col),
                     ).fetchone()
-                    if id_type_row and str(id_type_row["data_type"]).lower() != "text":
+                    if id_type_row and str(id_type_row["data_type"]).lower() not in {"text", "character varying"}:
+                        try:
+                            conn.execute(f'ALTER TABLE "{table}" ALTER COLUMN "{text_col}" DROP DEFAULT')
+                        except Exception:
+                            pass
                         conn.execute(
-                            "ALTER TABLE analyses ALTER COLUMN id TYPE TEXT USING id::text"
+                            f'ALTER TABLE "{table}" ALTER COLUMN "{text_col}" TYPE TEXT USING "{text_col}"::text'
                         )
             legacy_user = "legacy_admin"
             now = iso_now()
