@@ -112,12 +112,148 @@ def db():
 
 
 def init_db():
+    """Create the current schema and migrate older Render/Postgres schemas safely.
+
+    The previous deployment could have created an access_keys table without user_id.
+    CREATE TABLE IF NOT EXISTS does not alter an existing table, so indexes/FKs that
+    reference new columns would fail during startup. This migration adds missing
+    columns first and preserves legacy keys/data where possible.
+    """
     with db() as conn:
         if DATABASE_URL:
-            conn.execute(SCHEMA)
+            # Create base tables first. Keep columns nullable during migration so old
+            # rows can be upgraded without requiring impossible NOT NULL values.
+            conn.execute("""CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS access_keys (
+                key_hash TEXT PRIMARY KEY,
+                key_prefix TEXT,
+                user_id TEXT,
+                max_uses INTEGER DEFAULT 0,
+                uses INTEGER DEFAULT 0,
+                expires_at TEXT,
+                revoked INTEGER DEFAULT 0,
+                created_at TEXT,
+                last_used_at TEXT
+            )""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS analyses (
+                id TEXT PRIMARY KEY,
+                user_id TEXT,
+                team_a TEXT,
+                team_b TEXT,
+                competition TEXT,
+                match_date TEXT,
+                kickoff TEXT,
+                status TEXT,
+                result_json TEXT,
+                created_at TEXT
+            )""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS usage_logs (
+                id TEXT PRIMARY KEY,
+                user_id TEXT,
+                action TEXT,
+                status TEXT,
+                detail TEXT,
+                created_at TEXT
+            )""")
+
+            # Add every column expected by the current application to legacy tables.
+            migrations = {
+                "users": {
+                    "display_name": "TEXT",
+                    "created_at": "TEXT",
+                },
+                "access_keys": {
+                    "key_hash": "TEXT",
+                    "key_prefix": "TEXT",
+                    "user_id": "TEXT",
+                    "max_uses": "INTEGER DEFAULT 0",
+                    "uses": "INTEGER DEFAULT 0",
+                    "expires_at": "TEXT",
+                    "revoked": "INTEGER DEFAULT 0",
+                    "created_at": "TEXT",
+                    "last_used_at": "TEXT",
+                },
+                "analyses": {
+                    "id": "TEXT",
+                    "user_id": "TEXT",
+                    "team_a": "TEXT",
+                    "team_b": "TEXT",
+                    "competition": "TEXT",
+                    "match_date": "TEXT",
+                    "kickoff": "TEXT",
+                    "status": "TEXT",
+                    "result_json": "TEXT",
+                    "created_at": "TEXT",
+                },
+                "usage_logs": {
+                    "id": "TEXT",
+                    "user_id": "TEXT",
+                    "action": "TEXT",
+                    "status": "TEXT",
+                    "detail": "TEXT",
+                    "created_at": "TEXT",
+                },
+            }
+            for table, columns in migrations.items():
+                existing = {r[0] for r in conn.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema='public' AND table_name=%s", (table,)
+                ).fetchall()}
+                for column, definition in columns.items():
+                    if column not in existing:
+                        conn.execute(f'ALTER TABLE "{table}" ADD COLUMN "{column}" {definition}')
+
+            # Ensure a legacy-user bucket exists for keys created by older builds.
+            legacy_user = "legacy_admin"
+            now = iso_now()
+            conn.execute(
+                "INSERT INTO users(id,display_name,created_at) VALUES(%s,%s,%s) "
+                "ON CONFLICT (id) DO NOTHING",
+                (legacy_user, "Legacy / migrated user", now),
+            )
+
+            # Migrate plaintext legacy key_code/status columns when they exist.
+            access_cols = {r[0] for r in conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema='public' AND table_name='access_keys'"
+            ).fetchall()}
+            if "key_code" in access_cols:
+                legacy_rows = conn.execute(
+                    "SELECT key_code, status, expires_at, created_at FROM access_keys "
+                    "WHERE key_code IS NOT NULL"
+                ).fetchall()
+                for key_code, status, expires_at, created_at in legacy_rows:
+                    if not key_code:
+                        continue
+                    kh = sha256(str(key_code))
+                    revoked = 0 if str(status or "ACTIVE").upper() == "ACTIVE" else 1
+                    prefix = str(key_code)
+                    conn.execute(
+                        "UPDATE access_keys SET key_hash=%s,key_prefix=%s,user_id=COALESCE(user_id,%s),"
+                        "max_uses=COALESCE(max_uses,0),uses=COALESCE(uses,0),expires_at=COALESCE(expires_at,%s),"
+                        "revoked=COALESCE(revoked,%s),created_at=COALESCE(created_at,%s) WHERE key_code=%s",
+                        (kh, prefix, legacy_user, expires_at, revoked, created_at or now, key_code),
+                    )
+
+            # Fill missing values on rows from the partially migrated schema.
+            conn.execute("UPDATE access_keys SET user_id=%s WHERE user_id IS NULL", (legacy_user,))
+            conn.execute("UPDATE access_keys SET max_uses=0 WHERE max_uses IS NULL")
+            conn.execute("UPDATE access_keys SET uses=0 WHERE uses IS NULL")
+            conn.execute("UPDATE access_keys SET revoked=0 WHERE revoked IS NULL")
+            conn.execute("UPDATE access_keys SET created_at=%s WHERE created_at IS NULL", (now,))
+
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_access_user ON access_keys(user_id)")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_access_key_hash ON access_keys(key_hash) WHERE key_hash IS NOT NULL")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_analysis_user ON analyses(user_id, created_at DESC)")
+            conn.commit()
         else:
-            conn.executescript(SCHEMA.replace("TEXT PRIMARY KEY", "TEXT PRIMARY KEY").replace("REFERENCES users(id) ON DELETE CASCADE", "REFERENCES users(id)"))
-        conn.commit()
+            import sqlite3
+            conn.executescript(SCHEMA)
+            conn.commit()
 
 
 def adapt_sql(sql: str) -> str:
