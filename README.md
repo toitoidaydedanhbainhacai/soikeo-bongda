@@ -1,40 +1,24 @@
 # Quant Terminal 2026
 
-Production-oriented football betting intelligence terminal.
+Production-oriented Flask app for Render.
 
-## Pipeline
-User match inputs → real-time validation → RapidAPI Google Search74 → source collection → exact match verification with Gemini → deterministic Quant Engine → No-Bet Engine → user-specific history/watchlist.
+## Environment variables
+- `RAPIDAPI_KEY`: RapidAPI Google Search74 key.
+- `GEMINI_API_KEY`: Google Gemini API key.
+- `GEMINI_MODEL`: Gemini model name; override if your account uses another current model.
+- `ADMIN_TOKEN`: private admin secret used only on `/admin` and admin API routes.
+- `DATABASE_URL`: Render PostgreSQL **Internal Database URL**.
+- `REQUIRE_ACCESS_KEY=1`: require user Access Key (recommended).
 
-## Key-based multi-user data isolation
-Every user accesses the terminal with an access key. The server stores only a SHA-256 hash of each key. A key is bound to its own `user_id`; all analyses, usage logs, watchlist rows, bet tracking and odds snapshots are filtered by that user ID.
+## Removed
+The Odds API has been removed from this build. There is no `ODDS_API_KEY` dependency.
 
-Admins can create keys with optional `max_uses` and `expires_at`:
+## Flow
+User Access Key -> Google Search74 -> Gemini evidence extraction -> deterministic Quant Engine -> No Bet.
+Gemini is instructed to extract only explicitly supported values; it is not allowed to invent missing odds/form/stats.
 
-`POST /api/admin/keys` with header `X-Admin-Token` and JSON such as `{"note":"VIP 30 days","max_uses":100,"expires_at":"2026-10-24T23:59:59+07:00"}`.
+## Admin
+Open `/admin`, enter `ADMIN_TOKEN`, set user name, max uses (0 = unlimited), expiry days (0 = no expiry), then generate an Access Key.
 
-Revoke:
-
-`POST /api/admin/revoke-key` with `X-Admin-Token` and `{"key":"QT-..."}`.
-
-List:
-
-`GET /api/admin/keys` with `X-Admin-Token`.
-
-## Production persistence
-Render web services use an ephemeral filesystem by default. For long-term data, use PostgreSQL via `DATABASE_URL`, or attach a Render Persistent Disk and point `DB_FILE` inside the mounted path. PostgreSQL is the preferred multi-user production option.
-
-## No The Odds API
-There is no The Odds API dependency, environment variable, endpoint or default odds table in this build.
-
-## RapidAPI
-Google Search74 is server-side only:
-- Base: `https://google-search74.p.rapidapi.com/`
-- Header: `x-rapidapi-key`
-- Header: `x-rapidapi-host: google-search74.p.rapidapi.com`
-- Query: `query`, `limit`, `related_keywords`, `cursor`
-
-## Quant integrity
-Gemini is an evidence extraction/reconciliation layer. It is not allowed to create odds, xG, lambda, probability, EV or Kelly. The deterministic backend calculates those values only from verified structured evidence. If evidence is insufficient or conflicting, the result is NO BET / DATA CONFLICT.
-
-## Important
-Google Search results and public pages can be blocked or incomplete. The application treats unavailable sources as unavailable and never fabricates missing values.
+## Render
+Use `gunicorn main:app`. Add the four required environment variables (`RAPIDAPI_KEY`, `GEMINI_API_KEY`, `ADMIN_TOKEN`, `DATABASE_URL`).
