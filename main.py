@@ -10,6 +10,7 @@ import re
 import secrets
 import statistics
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from urllib.parse import quote_plus, urljoin, urlparse
@@ -45,7 +46,9 @@ APP_ENV = os.getenv("APP_ENV", "production").strip().lower()
 REQUIRE_ACCESS_KEY = os.getenv("REQUIRE_ACCESS_KEY", "1").strip().lower() not in {"0", "false", "no"}
 MAX_SEARCH_RESULTS = max(4, min(int(os.getenv("MAX_SEARCH_RESULTS", "10")), 20))
 MAX_SOURCE_PAGES = max(4, min(int(os.getenv("MAX_SOURCE_PAGES", "18")), 30))
-HTTP_TIMEOUT = max(5, min(int(os.getenv("HTTP_TIMEOUT", "12")), 30))
+HTTP_TIMEOUT = max(3, min(int(os.getenv("HTTP_TIMEOUT", "6")), 15))
+COLLECTOR_TIMEOUT = max(15, min(int(os.getenv("COLLECTOR_TIMEOUT", "35")), 60))
+SEARCH_TIMEOUT = max(2, min(int(os.getenv("SEARCH_TIMEOUT", "5")), 10))
 MAX_PAGE_CHARS = 18000
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -261,49 +264,51 @@ def clean_text(raw: str) -> str:
 
 
 def public_search(query: str) -> list[dict]:
-    """Search public HTML search pages. This is deliberately keyless; failures are normal."""
+    """Best-effort keyless HTML search. Never allowed to block the whole analysis."""
     headers = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9,vi;q=0.8"}
-    engines = [
+    endpoints = [
         "https://html.duckduckgo.com/html/?q=" + quote_plus(query),
-        "https://www.google.com/search?q=" + quote_plus(query) + "&num=10",
+        "https://www.google.com/search?q=" + quote_plus(query) + "&num=8",
     ]
     out = []
-    for endpoint in engines:
+    for endpoint in endpoints:
+        started = time.monotonic()
+        host = urlparse(endpoint).netloc
+        log.info("[COLLECTOR] search START %s", host)
         try:
-            r = requests.get(endpoint, headers=headers, timeout=HTTP_TIMEOUT)
+            r = requests.get(endpoint, headers=headers, timeout=(2, SEARCH_TIMEOUT), allow_redirects=True)
+            log.info("[COLLECTOR] search END %s status=%s elapsed=%.2fs", host, r.status_code, time.monotonic()-started)
             if r.status_code >= 400:
                 continue
             soup = BeautifulSoup(r.text, "html.parser")
             for a in soup.select("a[href]"):
                 href = a.get("href", "")
                 title = a.get_text(" ", strip=True)
-                if not href or not title:
+                if not href or not title or len(title) < 8:
                     continue
                 if href.startswith("//"):
                     href = "https:" + href
-                if href.startswith("/"):
+                elif href.startswith("/"):
                     href = urljoin(endpoint, href)
                 p = urlparse(href)
                 if p.scheme not in {"http", "https"}:
                     continue
-                host = p.netloc.lower()
-                if any(x in host for x in ["duckduckgo.com", "google.com", "gstatic.com"]):
+                if any(x in p.netloc.lower() for x in ["duckduckgo.com", "google.com", "gstatic.com"]):
                     continue
-                if len(title) < 8:
-                    continue
-                out.append({"url": href, "title": title[:300], "description": "", "engine": urlparse(endpoint).netloc})
+                out.append({"url": href.split("#")[0], "title": title[:300], "description": "", "engine": host})
             if len(out) >= MAX_SEARCH_RESULTS:
                 break
+        except requests.Timeout:
+            log.warning("[COLLECTOR] search TIMEOUT %s after %.2fs", host, time.monotonic()-started)
+        except requests.RequestException as exc:
+            log.warning("[COLLECTOR] search ERROR %s: %s", host, exc)
         except Exception as exc:
-            log.info("[COLLECTOR] search engine failed: %s", exc)
+            log.warning("[COLLECTOR] search PARSE_ERROR %s: %s", host, exc)
     seen, deduped = set(), []
     for x in out:
-        u = x["url"].split("#")[0]
-        if u in seen:
+        if x["url"] in seen:
             continue
-        seen.add(u)
-        x["url"] = u
-        deduped.append(x)
+        seen.add(x["url"]); deduped.append(x)
     return deduped[:MAX_SEARCH_RESULTS]
 
 
@@ -311,20 +316,15 @@ def build_queries(a: str, b: str, comp: str, date: str) -> list[str]:
     base = f'"{a}" "{b}" "{comp}" "{date}"'
     return [
         base,
-        f'{base} fixture match result',
-        f'{base} odds Asian handicap over under',
-        f'{base} lineup injuries suspension team news',
-        f'{base} xG xGA statistics form',
-        f'{base} site:sofascore.com',
-        f'{base} site:fotmob.com',
-        f'{base} site:fbref.com',
-        f'{base} site:understat.com',
+        f'{base} fixture lineup injuries',
+        f'{base} odds over under handicap',
+        f'{base} xG statistics form site:sofascore.com OR site:fotmob.com OR site:fbref.com',
     ]
 
 
 def fetch_public_page(url: str) -> Optional[dict]:
     try:
-        r = requests.get(url, headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9,vi;q=0.8"}, timeout=HTTP_TIMEOUT, allow_redirects=True)
+        r = requests.get(url, headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9,vi;q=0.8"}, timeout=(2, HTTP_TIMEOUT), allow_redirects=True)
         ctype = r.headers.get("content-type", "")
         if r.status_code >= 400 or "text/html" not in ctype and "application/xhtml" not in ctype:
             return None
@@ -338,34 +338,67 @@ def fetch_public_page(url: str) -> Optional[dict]:
 
 
 def collect_research(a: str, b: str, comp: str, date: str) -> dict:
-    log.info("[COLLECTOR] start: %s vs %s | %s | %s", a, b, comp, date)
-    candidates = []
-    errors = []
-    for q in build_queries(a, b, comp, date):
-        log.info("[COLLECTOR] public search: %s", q)
-        try:
-            candidates.extend(public_search(q))
-        except Exception as exc:
-            errors.append(str(exc))
+    """Concurrent, deadline-bounded collector. A blocked search source must never hang /api/analyze."""
+    started = time.monotonic()
+    deadline = started + COLLECTOR_TIMEOUT
+    log.info("[COLLECTOR] start: %s vs %s | %s | %s | deadline=%ss", a, b, comp, date, COLLECTOR_TIMEOUT)
+    queries = build_queries(a, b, comp, date)
+    candidates, errors = [], []
+
+    # Search in parallel so one blocked engine/query cannot serialize 4 x 2 timeouts.
+    workers = min(8, max(2, len(queries)))
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="collector-search")
+    futures = {pool.submit(public_search, q): q for q in queries}
+    try:
+        remaining = max(0.1, deadline - time.monotonic())
+        for fut in as_completed(futures, timeout=remaining):
+            q = futures[fut]
+            log.info("[COLLECTOR] public search DONE: %s", q)
+            try:
+                candidates.extend(fut.result())
+            except Exception as exc:
+                errors.append(f"search: {exc}")
+    except TimeoutError:
+        errors.append("collector search deadline reached")
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    # Any unfinished futures are abandoned; their socket calls have their own timeout.
+    if time.monotonic() >= deadline:
+        errors.append("collector search deadline reached")
+
     seen, unique = set(), []
     for s in candidates:
         u = s["url"]
         if u in seen:
             continue
-        seen.add(u)
-        unique.append(s)
-    # Prefer football-data domains but do not assume they are correct until Gemini validates identity.
+        seen.add(u); unique.append(s)
     preferred = [s for s in unique if any(d in urlparse(s["url"]).netloc.lower() for d in ["sofascore.com", "fotmob.com", "fbref.com", "understat.com"])]
     rest = [s for s in unique if s not in preferred]
     ordered = preferred + rest
+
     pages = []
-    for s in ordered[:MAX_SOURCE_PAGES]:
-        page = fetch_public_page(s["url"])
-        if page:
-            page.update({"search_title": s.get("title", ""), "search_engine": s.get("engine", "")})
-            pages.append(page)
-    log.info("[COLLECTOR] candidates=%s fetched_pages=%s errors=%s", len(unique), len(pages), len(errors))
-    return {"sources": pages, "search_results": unique[:MAX_SEARCH_RESULTS * 4], "errors": errors}
+    remaining = max(0.1, deadline - time.monotonic())
+    if ordered and remaining > 0.5:
+        max_pages = min(MAX_SOURCE_PAGES, len(ordered))
+        pool = ThreadPoolExecutor(max_workers=min(8, max_pages), thread_name_prefix="collector-fetch")
+        futures = {pool.submit(fetch_public_page, s["url"]): s for s in ordered[:max_pages]}
+        try:
+            for fut in as_completed(futures, timeout=remaining):
+                src = futures[fut]
+                try:
+                    page = fut.result()
+                except Exception as exc:
+                    page = None; errors.append(f"fetch {src['url']}: {exc}")
+                if page:
+                    page.update({"search_title": src.get("title", ""), "search_engine": src.get("engine", "")})
+                    pages.append(page)
+        except TimeoutError:
+            errors.append("collector page-fetch deadline reached")
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+    elapsed = time.monotonic() - started
+    log.info("[COLLECTOR] end: candidates=%s fetched_pages=%s errors=%s elapsed=%.2fs", len(unique), len(pages), len(errors), elapsed)
+    return {"sources": pages, "search_results": unique[:MAX_SEARCH_RESULTS * 4], "errors": errors, "elapsed_seconds": round(elapsed, 2), "deadline_seconds": COLLECTOR_TIMEOUT}
 
 
 # ---------- Gemini evidence normalization ----------
@@ -509,7 +542,7 @@ def health():
     db_ok = True
     try: qone("SELECT 1 AS ok")
     except Exception: db_ok = False
-    return jsonify({"status": "OK" if db_ok else "DEGRADED", "version": APP_VERSION, "database": "postgresql" if DATABASE_URL else "sqlite_fallback", "database_ok": db_ok, "free_web_collector": True, "gemini_configured": bool(GEMINI_API_KEY), "admin_configured": bool(ADMIN_TOKEN), "rapidapi_configured": False, "search_grounding": False, "odds_api_configured": False})
+    return jsonify({"status": "OK" if db_ok else "DEGRADED", "version": APP_VERSION, "database": "postgresql" if DATABASE_URL else "sqlite_fallback", "database_ok": db_ok, "free_web_collector": True, "collector_timeout_seconds": COLLECTOR_TIMEOUT, "search_timeout_seconds": SEARCH_TIMEOUT, "gemini_configured": bool(GEMINI_API_KEY), "admin_configured": bool(ADMIN_TOKEN), "rapidapi_configured": False, "search_grounding": False, "odds_api_configured": False})
 
 
 @app.get("/")
@@ -629,7 +662,7 @@ USER_HTML = r'''<!doctype html><html lang="vi"><head><meta charset="utf-8"><meta
 <section id="terminal" class="hidden"><section class="hero"><div class="eyebrow">FOOTBALL INTELLIGENCE</div><h1>Research. Verify. Quantify.</h1><p>Gemini chỉ chuẩn hóa bằng chứng. Free Web Collector thu thập nguồn công khai. Quant Engine tự tính toán — không bịa kèo.</p></section>
 <section class="glass research"><div class="cardhead"><div><h2>Research Match</h2><div class="sub">Live public-web research · GMT+7</div></div><span id="badge" class="badge">READY</span></div><div class="grid"><div class="field"><label>ĐỘI A</label><input id="a" placeholder="Home team"></div><div class="field"><label>ĐỘI B</label><input id="b" placeholder="Away team"></div><div class="field"><label>GIẢI ĐẤU</label><input id="comp" placeholder="Competition"></div><div class="field small"><label>NGÀY THI ĐẤU</label><input id="date" type="date"></div><div class="field small"><label>KICKOFF GMT+7</label><input id="kick" type="time"></div></div><button class="cta" onclick="analyze()">⌁ FIND & ANALYZE</button><div id="msg" class="sub" style="margin-top:12px"></div><div class="pipeline"><span id="s1" class="step">WEB RESEARCH</span><span id="s2" class="step">GEMINI</span><span id="s3" class="step">MATCH VERIFY</span><span id="s4" class="step">QUANT ENGINE</span><span id="s5" class="step">VALUE / NO BET</span></div></section>
 <section id="out"></section><section class="card" style="margin-top:15px"><div class="cardhead"><div><h3>Recent Analyses</h3><div class="sub">Private history for this Access Key</div></div><button class="ghost" onclick="historyLoad()">Refresh</button></div><div id="hist" class="muted">Chưa tải.</div></section></section></main><nav class="bottom"><button>⌂<br>Home</button><button>◉<br>Matches</button><button>◆<br>Picks</button><button>⌁<br>Market</button><button>•••<br>More</button></nav>
-<script>const $=id=>document.getElementById(id);const esc=v=>String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));function setStep(n){for(let i=1;i<=5;i++)$('s'+i).classList.toggle('active',i===n)}async function login(){let r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({access_key:$('key').value.trim()})});let d=await r.json();if(!r.ok){$('loginmsg').innerHTML='<div class="error">'+esc(d.message||'Invalid Access Key')+'</div>';return}$('login').classList.add('hidden');$('terminal').classList.remove('hidden');historyLoad()}async function analyze(){let p={team_a:$('a').value.trim(),team_b:$('b').value.trim(),competition:$('comp').value.trim(),match_date:$('date').value,kickoff:$('kick').value};$('out').innerHTML='';$('badge').textContent='RESEARCHING';$('msg').textContent='Đang thu thập nguồn công khai…';setStep(1);let r;try{r=await fetch('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});$('msg').textContent='Đang xác minh và chạy Quant Engine…';setStep(3)}catch(e){$('badge').textContent='FAILED';$('msg').textContent='Network error';return}let d=await r.json();if(d.status==='OK'){setStep(5);$('badge').textContent='VALUE'}else if(d.status==='NO_BET'){setStep(5);$('badge').textContent='NO BET'}else{$('badge').textContent=d.status;setStep(d.pipeline&&d.pipeline.quant==='CALCULATED'?4:3)}if(!r.ok){$('out').innerHTML='<div class="card error">'+esc(d.message||d.status)+'</div>';return}render(d)}function render(d){let p=d.pick,m=d.model;let html='<div class="dashboard"><section class="card pick"><div><span class="badge '+(d.status==='OK'?'verified':'nobet')+'">'+esc(d.status)+'</span><div class="sub" style="margin-top:17px">PRIMARY PICK</div><div class="pickmain">'+esc(p?p.market.replaceAll('_',' ').toUpperCase():'NO BET')+'</div><p class="muted">'+esc(d.message||'')+'</p></div><div class="metrics"><div class="metric"><span>Model</span><b>'+esc(p?p.probability.toFixed(2)+'%':'—')+'</b></div><div class="metric"><span>Market</span><b>'+esc(p?p.market_probability.toFixed(2)+'%':'—')+'</b></div><div class="metric"><span>EV</span><b>'+esc(p?(p.ev>=0?'+':'')+p.ev.toFixed(2)+'%':'—')+'</b></div></div></section><section class="card"><div class="cardhead"><div><h3>'+esc(d.team_a)+' vs '+esc(d.team_b)+'</h3><div class="sub">'+esc(d.competition)+' · '+esc(d.match_date)+' · '+esc(d.kickoff)+' GMT+7</div></div><span class="badge">'+esc(d.pipeline?.validation||'—')+'</span></div><div class="tabs"><span class="tab active">MODEL</span><span class="tab">FORM</span><span class="tab">XG</span><span class="tab">LINEUP</span><span class="tab">ODDS</span><span class="tab">NEWS</span></div><div style="margin-top:16px" class="metrics"><div class="metric"><span>λ Home</span><b>'+esc(m?m.lambda_home.toFixed(2):'—')+'</b></div><div class="metric"><span>λ Away</span><b>'+esc(m?m.lambda_away.toFixed(2):'—')+'</b></div><div class="metric"><span>Data</span><b style="font-size:12px">'+esc(m?m.data_quality:'INSUFFICIENT')+'</b></div></div></section></div><section class="card" style="margin-top:15px"><div class="cardhead"><div><h3>Research Evidence</h3><div class="sub">Gemini-normalized public sources · no fabricated values</div></div></div><details><summary>View Full Analysis JSON</summary><pre>'+esc(JSON.stringify(d,null,2))+'</pre></details></section>';$('out').innerHTML=html}async function historyLoad(){let r=await fetch('/api/history');if(!r.ok)return;let d=await r.json();$('hist').innerHTML=d.length?d.map(x=>'<div class="historyrow"><span>'+esc(x.team_a)+' vs '+esc(x.team_b)+'</span><span>'+esc(x.status)+' · '+esc(x.created_at)+'</span></div>').join(''):'Chưa có lịch sử'}(async()=>{let r=await fetch('/api/me');if(r.ok){$('login').classList.add('hidden');$('terminal').classList.remove('hidden');historyLoad()}})();</script></body></html>'''
+<script>const $=id=>document.getElementById(id);const esc=v=>String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));function setStep(n){for(let i=1;i<=5;i++)$('s'+i).classList.toggle('active',i===n)}async function login(){let r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({access_key:$('key').value.trim()})});let d=await r.json();if(!r.ok){$('loginmsg').innerHTML='<div class="error">'+esc(d.message||'Invalid Access Key')+'</div>';return}$('login').classList.add('hidden');$('terminal').classList.remove('hidden');historyLoad()}async function analyze(){let p={team_a:$('a').value.trim(),team_b:$('b').value.trim(),competition:$('comp').value.trim(),match_date:$('date').value,kickoff:$('kick').value};$('out').innerHTML='';$('badge').textContent='RESEARCHING';$('msg').textContent='Đang thu thập nguồn công khai…';setStep(1);let r;let controller=new AbortController();let timer=setTimeout(()=>controller.abort(),75000);try{r=await fetch('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p),signal:controller.signal});$('msg').textContent='Đang xác minh và chạy Quant Engine…';setStep(3)}catch(e){$('badge').textContent=e.name==='AbortError'?'TIMEOUT':'FAILED';$('msg').textContent=e.name==='AbortError'?'Nghiên cứu vượt quá thời gian cho phép. Hệ thống đã dừng request để tránh loading vô hạn.':'Network error';return}finally{clearTimeout(timer)}let d=await r.json();if(d.status==='OK'){setStep(5);$('badge').textContent='VALUE'}else if(d.status==='NO_BET'){setStep(5);$('badge').textContent='NO BET'}else{$('badge').textContent=d.status;setStep(d.pipeline&&d.pipeline.quant==='CALCULATED'?4:3)}if(!r.ok){$('out').innerHTML='<div class="card error">'+esc(d.message||d.status)+'</div>';return}render(d)}function render(d){let p=d.pick,m=d.model;let html='<div class="dashboard"><section class="card pick"><div><span class="badge '+(d.status==='OK'?'verified':'nobet')+'">'+esc(d.status)+'</span><div class="sub" style="margin-top:17px">PRIMARY PICK</div><div class="pickmain">'+esc(p?p.market.replaceAll('_',' ').toUpperCase():'NO BET')+'</div><p class="muted">'+esc(d.message||'')+'</p></div><div class="metrics"><div class="metric"><span>Model</span><b>'+esc(p?p.probability.toFixed(2)+'%':'—')+'</b></div><div class="metric"><span>Market</span><b>'+esc(p?p.market_probability.toFixed(2)+'%':'—')+'</b></div><div class="metric"><span>EV</span><b>'+esc(p?(p.ev>=0?'+':'')+p.ev.toFixed(2)+'%':'—')+'</b></div></div></section><section class="card"><div class="cardhead"><div><h3>'+esc(d.team_a)+' vs '+esc(d.team_b)+'</h3><div class="sub">'+esc(d.competition)+' · '+esc(d.match_date)+' · '+esc(d.kickoff)+' GMT+7</div></div><span class="badge">'+esc(d.pipeline?.validation||'—')+'</span></div><div class="tabs"><span class="tab active">MODEL</span><span class="tab">FORM</span><span class="tab">XG</span><span class="tab">LINEUP</span><span class="tab">ODDS</span><span class="tab">NEWS</span></div><div style="margin-top:16px" class="metrics"><div class="metric"><span>λ Home</span><b>'+esc(m?m.lambda_home.toFixed(2):'—')+'</b></div><div class="metric"><span>λ Away</span><b>'+esc(m?m.lambda_away.toFixed(2):'—')+'</b></div><div class="metric"><span>Data</span><b style="font-size:12px">'+esc(m?m.data_quality:'INSUFFICIENT')+'</b></div></div></section></div><section class="card" style="margin-top:15px"><div class="cardhead"><div><h3>Research Evidence</h3><div class="sub">Gemini-normalized public sources · no fabricated values</div></div></div><details><summary>View Full Analysis JSON</summary><pre>'+esc(JSON.stringify(d,null,2))+'</pre></details></section>';$('out').innerHTML=html}async function historyLoad(){let r=await fetch('/api/history');if(!r.ok)return;let d=await r.json();$('hist').innerHTML=d.length?d.map(x=>'<div class="historyrow"><span>'+esc(x.team_a)+' vs '+esc(x.team_b)+'</span><span>'+esc(x.status)+' · '+esc(x.created_at)+'</span></div>').join(''):'Chưa có lịch sử'}(async()=>{let r=await fetch('/api/me');if(r.ok){$('login').classList.add('hidden');$('terminal').classList.remove('hidden');historyLoad()}})();</script></body></html>'''
 
 ADMIN_HTML = r'''<!doctype html><html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#080c14"><title>Admin — Soi Kèo AI</title><style>body{margin:0;background:#080c14;color:#edf2f7;font:14px Inter,system-ui,sans-serif}.wrap{max-width:1050px;margin:auto;padding:25px}.card{background:rgba(17,24,39,.7);border:1px solid rgba(255,255,255,.09);border-radius:24px;padding:20px;margin:14px 0;backdrop-filter:blur(16px)}input,button{padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,.1);background:#0b121e;color:#fff}button{background:linear-gradient(110deg,#f5b84b,#ffe08a);color:#111;font-weight:800;cursor:pointer}table{width:100%;border-collapse:collapse}td,th{padding:11px;text-align:left;border-bottom:1px solid rgba(255,255,255,.08)}.mono{font-family:monospace;word-break:break-all}.ok{color:#26d391}.bad{color:#ff6f7d}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}</style></head><body><div class="wrap"><h1>🔐 SOI KÈO AI — ADMIN</h1><p style="color:#8995a8">Access Key management · Gemini + Free Web Collector · Quant Engine</p><section class="card"><div class="grid"><input id="admin" placeholder="ADMIN_TOKEN"><input id="name" placeholder="Tên user"><input id="uses" type="number" min="0" value="100"><input id="days" type="number" min="0" value="30"></div><br><button onclick="createKey()">Generate Access Key</button> <button onclick="loadKeys()">Refresh</button><div id="msg"></div></section><section id="newkey" class="card" style="display:none"></section><section class="card"><table><thead><tr><th>User</th><th>Key</th><th>Uses</th><th>Expiry</th><th>Status</th></tr></thead><tbody id="rows"></tbody></table></section></div><script>const $=x=>document.getElementById(x);async function createKey(){let r=await fetch('/api/admin/create-key',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Token':$('admin').value},body:JSON.stringify({name:$('name').value,max_uses:Number($('uses').value||0),expiry_days:Number($('days').value||0)})});let d=await r.json();if(!r.ok){$('msg').innerHTML='<span class="bad">'+(d.message||d.status)+'</span>';return}$('newkey').style.display='block';$('newkey').innerHTML='<b>ACCESS KEY — copy now</b><p class="mono ok">'+d.access_key+'</p><small>Chỉ hiển thị một lần.</small>';$('msg').textContent='Created';loadKeys()}async function loadKeys(){let r=await fetch('/api/admin/keys',{headers:{'X-Admin-Token':$('admin').value}});let d=await r.json();if(!r.ok){$('msg').innerHTML='<span class="bad">'+(d.message||d.status)+'</span>';return}$('rows').innerHTML=d.map(x=>'<tr><td>'+x.display_name+'</td><td class="mono">'+x.key_prefix+'…</td><td>'+x.uses+' / '+(x.max_uses||'∞')+'</td><td>'+(x.expires_at||'∞')+'</td><td>'+(!x.revoked?'ACTIVE':'REVOKED')+'</td></tr>').join('')}</script></body></html>'''
 
