@@ -199,7 +199,7 @@ def init_db():
                 },
             }
             for table, columns in migrations.items():
-                existing = {r[0] for r in conn.execute(
+                existing = {r["column_name"] for r in conn.execute(
                     "SELECT column_name FROM information_schema.columns "
                     "WHERE table_schema='public' AND table_name=%s", (table,)
                 ).fetchall()}
@@ -217,7 +217,7 @@ def init_db():
             )
 
             # Migrate plaintext legacy key_code/status columns when they exist.
-            access_cols = {r[0] for r in conn.execute(
+            access_cols = {r["column_name"] for r in conn.execute(
                 "SELECT column_name FROM information_schema.columns "
                 "WHERE table_schema='public' AND table_name='access_keys'"
             ).fetchall()}
@@ -226,7 +226,11 @@ def init_db():
                     "SELECT key_code, status, expires_at, created_at FROM access_keys "
                     "WHERE key_code IS NOT NULL"
                 ).fetchall()
-                for key_code, status, expires_at, created_at in legacy_rows:
+                for legacy in legacy_rows:
+                    key_code = legacy["key_code"]
+                    status = legacy["status"]
+                    expires_at = legacy["expires_at"]
+                    created_at = legacy["created_at"]
                     if not key_code:
                         continue
                     kh = sha256(str(key_code))
