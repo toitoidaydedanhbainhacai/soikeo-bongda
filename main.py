@@ -156,6 +156,19 @@ def init_db():
                 for col, definition in cols.items():
                     if col not in existing:
                         conn.execute(f'ALTER TABLE "{table}" ADD COLUMN "{col}" {definition}')
+
+                # Legacy PostgreSQL builds may have created analyses.id as BIGINT/SERIAL.
+                # The current application uses opaque text IDs such as an_*. Convert the
+                # existing column in-place so new analyses cannot fail with bigint errors.
+                if table == "analyses":
+                    id_type_row = conn.execute(
+                        "SELECT data_type FROM information_schema.columns "
+                        "WHERE table_schema='public' AND table_name='analyses' AND column_name='id'"
+                    ).fetchone()
+                    if id_type_row and str(id_type_row["data_type"]).lower() != "text":
+                        conn.execute(
+                            "ALTER TABLE analyses ALTER COLUMN id TYPE TEXT USING id::text"
+                        )
             legacy_user = "legacy_admin"
             now = iso_now()
             conn.execute("INSERT INTO users(id,display_name,created_at) VALUES(%s,%s,%s) ON CONFLICT (id) DO NOTHING", (legacy_user, "Legacy / migrated user", now))
