@@ -157,6 +157,16 @@ def init_db():
                     if col not in existing:
                         conn.execute(f'ALTER TABLE "{table}" ADD COLUMN "{col}" {definition}')
 
+                # Clean up the obsolete legacy key_hash column from usage_logs.
+                # Access-key hashes belong only in access_keys; usage_logs records
+                # user/action/status metadata and must never depend on key_hash.
+                if table == "usage_logs" and "key_hash" in existing:
+                    try:
+                        conn.execute('ALTER TABLE "usage_logs" DROP COLUMN "key_hash" CASCADE')
+                        log.info("Removed legacy usage_logs.key_hash column")
+                    except Exception as exc:
+                        log.warning("Could not remove legacy usage_logs.key_hash: %s", exc)
+
                 # Legacy Render databases may contain BIGINT/SERIAL identifiers in
                 # tables that the current application writes with opaque text IDs
                 # (an_*, log_*, usr_*).  CREATE TABLE IF NOT EXISTS cannot change an
